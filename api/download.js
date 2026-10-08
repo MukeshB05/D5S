@@ -1,9 +1,5 @@
 import { Readable } from "node:stream";
 
-/* =========================================================
-   ALLOWED MEDIA HOSTS
-========================================================= */
-
 const ALLOWED_HOSTS = [
   "saavncdn.com",
   "jiosaavn.com",
@@ -11,10 +7,6 @@ const ALLOWED_HOSTS = [
   "aac.saavncdn.com",
   "scdn.co",
 ];
-
-/* =========================================================
-   HOST VALIDATION
-========================================================= */
 
 const isAllowedHost = (hostname) => {
   const host = String(hostname || "")
@@ -28,96 +20,104 @@ const isAllowedHost = (hostname) => {
   );
 };
 
-/* =========================================================
-   GET URL PARAMETER
-========================================================= */
-
-const getTargetUrl = (req) => {
-  const value = req.query?.url;
-
-  if (Array.isArray(value)) {
-    return value[0] || "";
-  }
-
-  return typeof value === "string"
-    ? value
-    : "";
-};
-
-/* =========================================================
-   PARSE + VALIDATE URL
-========================================================= */
-
 const parseAllowedUrl = (value) => {
-  let parsed;
+  let url;
 
   try {
-    parsed = new URL(value);
+    url = new URL(value);
   } catch {
-    throw new Error("Invalid URL");
+    throw new Error(
+      "Invalid URL"
+    );
   }
 
   if (
-    parsed.protocol !== "http:" &&
-    parsed.protocol !== "https:"
+    url.protocol !== "http:" &&
+    url.protocol !== "https:"
   ) {
     throw new Error(
       "Only HTTP(S) URLs are supported"
     );
   }
 
-  if (!isAllowedHost(parsed.hostname)) {
+  if (
+    !isAllowedHost(
+      url.hostname
+    )
+  ) {
     throw new Error(
       "Host is not allowed"
     );
   }
 
-  return parsed;
+  return url;
 };
 
-/* =========================================================
-   FETCH WITH SAFE REDIRECT VALIDATION
-========================================================= */
+const getTargetUrl = (req) => {
+  const value =
+    req.query?.url;
 
-const fetchWithValidatedRedirects = async (
+  if (
+    Array.isArray(value)
+  ) {
+    return value[0] || "";
+  }
+
+  return typeof value ===
+    "string"
+    ? value
+    : "";
+};
+
+const fetchUpstream = async (
   initialUrl,
   method,
-  headers
+  reqHeaders
 ) => {
   let target =
-    parseAllowedUrl(initialUrl);
-
-  const MAX_REDIRECTS = 4;
+    parseAllowedUrl(
+      initialUrl
+    );
 
   for (
     let attempt = 0;
-    attempt <= MAX_REDIRECTS;
+    attempt < 5;
     attempt += 1
   ) {
-    const response = await fetch(
-      target.toString(),
-      {
-        method,
-        headers,
-        redirect: "manual",
-      }
-    );
+    const headers = {};
 
-    const isRedirect =
-      [301, 302, 303, 307, 308].includes(
-        response.status
-      );
-
-    if (!isRedirect) {
-      return response;
+    if (reqHeaders?.Range) {
+      headers.Range =
+        reqHeaders.Range;
     }
 
-    if (
-      attempt >= MAX_REDIRECTS
-    ) {
-      throw new Error(
-        "Too many upstream redirects"
+    if (reqHeaders?.["If-Range"]) {
+      headers["If-Range"] =
+        reqHeaders["If-Range"];
+    }
+
+    const response =
+      await fetch(
+        target.href,
+        {
+          method,
+          headers,
+          redirect: "manual",
+        }
       );
+
+    if (
+      ![
+        301,
+        302,
+        303,
+        307,
+        308,
+      ].includes(
+        response.status
+      )
+    ) {
+      return response;
     }
 
     const location =
@@ -131,34 +131,12 @@ const fetchWithValidatedRedirects = async (
       );
     }
 
-    /*
-     * new URL() correctly handles:
-     *
-     * /file.mp3
-     * //cdn.example.com/file.mp3
-     * https://cdn.example.com/file.mp3
-     */
-    let nextUrl;
-
-    try {
-      nextUrl = new URL(
-        location,
-        target
-      );
-    } catch {
-      throw new Error(
-        "Invalid upstream redirect URL"
-      );
-    }
-
-    /*
-     * Revalidate EVERY redirect destination.
-     * This prevents an allowed CDN from redirecting
-     * the server to an arbitrary host.
-     */
     target =
       parseAllowedUrl(
-        nextUrl.toString()
+        new URL(
+          location,
+          target
+        ).href
       );
   }
 
@@ -167,11 +145,7 @@ const fetchWithValidatedRedirects = async (
   );
 };
 
-/* =========================================================
-   COPY SAFE RESPONSE HEADERS
-========================================================= */
-
-const setResponseHeaders = (
+const setMediaHeaders = (
   res,
   upstream
 ) => {
@@ -211,36 +185,6 @@ const setResponseHeaders = (
     contentType
   );
 
-  /*
-   * The media is being streamed through our endpoint.
-   * Do not let a CDN/browser cache an arbitrary upstream
-   * response indefinitely.
-   */
-  res.setHeader(
-    "Cache-Control",
-    "private, no-store, max-age=0"
-  );
-
-  /*
-   * Required by the browser-side download code.
-   */
-  res.setHeader(
-    "Access-Control-Allow-Origin",
-    "*"
-  );
-
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    [
-      "Content-Length",
-      "Content-Range",
-      "Accept-Ranges",
-      "Content-Type",
-      "ETag",
-      "Last-Modified",
-    ].join(", ")
-  );
-
   if (contentLength) {
     res.setHeader(
       "Content-Length",
@@ -257,7 +201,8 @@ const setResponseHeaders = (
 
   res.setHeader(
     "Accept-Ranges",
-    acceptRanges || "bytes"
+    acceptRanges ||
+      "bytes"
   );
 
   if (etag) {
@@ -273,20 +218,34 @@ const setResponseHeaders = (
       lastModified
     );
   }
-};
 
-/* =========================================================
-   MAIN VERCEL HANDLER
-========================================================= */
+  res.setHeader(
+    "Cache-Control",
+    "private, no-store, max-age=0"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    [
+      "Content-Length",
+      "Content-Range",
+      "Accept-Ranges",
+      "Content-Type",
+      "ETag",
+      "Last-Modified",
+    ].join(", ")
+  );
+};
 
 export default async function handler(
   req,
   res
 ) {
-  /*
-   * Only GET and HEAD are required by the
-   * browser download/player flow.
-   */
   if (
     req.method !== "GET" &&
     req.method !== "HEAD"
@@ -296,25 +255,26 @@ export default async function handler(
       "GET, HEAD"
     );
 
-    return res.status(405).json({
-      error:
-        "Method not allowed",
-    });
+    return res
+      .status(405)
+      .json({
+        error:
+          "Method not allowed",
+      });
   }
 
   const rawUrl =
     getTargetUrl(req);
 
   if (!rawUrl) {
-    return res.status(400).json({
-      error:
-        "Missing url parameter",
-    });
+    return res
+      .status(400)
+      .json({
+        error:
+          "Missing url parameter",
+      });
   }
 
-  /*
-   * Validate the original URL before fetching.
-   */
   try {
     parseAllowedUrl(rawUrl);
   } catch (error) {
@@ -335,63 +295,37 @@ export default async function handler(
   }
 
   try {
-    /*
-     * Forward only the request headers that are
-     * useful for media/range requests.
-     */
-    const headers = {};
-
-    if (req.headers.range) {
-      headers.Range =
-        req.headers.range;
-    }
-
-    if (req.headers["if-range"]) {
-      headers["If-Range"] =
-        req.headers["if-range"];
-    }
-
     const upstream =
-      await fetchWithValidatedRedirects(
+      await fetchUpstream(
         rawUrl,
         req.method,
-        headers
+        req.headers
       );
 
-    /*
-     * A normal successful response:
-     * 200 OK
-     *
-     * A partial media response:
-     * 206 Partial Content
-     */
     if (
       !upstream.ok &&
       upstream.status !== 206
     ) {
-      const status =
-        upstream.status >= 400 &&
-        upstream.status <= 599
-          ? upstream.status
-          : 502;
-
-      return res.status(status).json({
-        error:
-          `Upstream request failed: ${upstream.status}`,
-      });
+      return res
+        .status(
+          upstream.status >=
+            400 &&
+          upstream.status <=
+            599
+            ? upstream.status
+            : 502
+        )
+        .json({
+          error:
+            `Upstream request failed: ${upstream.status}`,
+        });
     }
 
-    /*
-     * Forward media headers.
-     */
-    setResponseHeaders(
+    setMediaHeaders(
       res,
       upstream
     );
 
-    /*
-     * HEAD must never send the upstream body.
-     */
     if (
       req.method === "HEAD" ||
       !upstream.body
@@ -399,10 +333,6 @@ export default async function handler(
       return res.end();
     }
 
-    /*
-     * Stream the media directly to the browser.
-     * This avoids buffering the complete song in memory.
-     */
     const stream =
       Readable.fromWeb(
         upstream.body
@@ -416,17 +346,19 @@ export default async function handler(
           error
         );
 
-        /*
-         * The response may already have started.
-         * At that point we cannot safely send JSON.
-         */
-        if (!res.headersSent) {
-          res.status(502).json({
-            error:
-              "Media stream failed",
-          });
+        if (
+          !res.headersSent
+        ) {
+          res
+            .status(502)
+            .json({
+              error:
+                "Media stream failed",
+            });
         } else {
-          res.destroy(error);
+          res.destroy(
+            error
+          );
         }
       }
     );
@@ -438,18 +370,18 @@ export default async function handler(
       error
     );
 
-    /*
-     * If headers have already been sent, don't try
-     * to write a second HTTP response.
-     */
-    if (res.headersSent) {
+    if (
+      res.headersSent
+    ) {
       return res.end();
     }
 
-    return res.status(502).json({
-      error:
-        error?.message ||
-        "Could not fetch the media file",
-    });
+    return res
+      .status(502)
+      .json({
+        error:
+          error?.message ||
+          "Could not fetch the media file",
+      });
   }
 }

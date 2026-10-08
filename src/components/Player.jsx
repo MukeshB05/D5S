@@ -110,6 +110,22 @@ const getFFmpeg = async () => {
   return ffmpegLoadPromise;
 };
 
+/* =========================================================
+   SAFE DECODE
+========================================================= */
+
+const safeDecode = (value) => {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  try {
+    return he.decode(String(value));
+  } catch {
+    return String(value);
+  }
+};
+
 const sanitizeMetadata = (value, fallback = "") =>
   safeDecode(value ?? "").replace(/\0/g, "").trim() || fallback;
 
@@ -227,6 +243,8 @@ const embedWithCover = async (
       "-vn",
       "-c:a",
       "libmp3lame",
+      "-threads",
+      "1",
       "-b:a",
       "320k",
       "-ar",
@@ -420,22 +438,6 @@ const formatDownloadClock = (seconds) => {
 };
 
 /* =========================================================
-   SAFE DECODE
-========================================================= */
-
-const safeDecode = (value) => {
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  try {
-    return he.decode(String(value));
-  } catch {
-    return String(value);
-  }
-};
-
-/* =========================================================
    RESOLVE IMAGE
 ========================================================= */
 
@@ -504,6 +506,58 @@ const resolveImage = (value) => {
 /* =========================================================
    GET IMAGE
 ========================================================= */
+
+const resolveMediaUrl = (value) => {
+  const visit = (item) => {
+    if (!item) {
+      return "";
+    }
+
+    if (typeof item === "string") {
+      return item.trim();
+    }
+
+    if (Array.isArray(item)) {
+      for (
+        let index = item.length - 1;
+        index >= 0;
+        index -= 1
+      ) {
+        const result = visit(item[index]);
+
+        if (result) {
+          return result;
+        }
+      }
+
+      return "";
+    }
+
+    if (typeof item === "object") {
+      const keys = [
+        "url",
+        "link",
+        "src",
+        "downloadUrl",
+        "download_url",
+        "audioUrl",
+        "audio_url",
+      ];
+
+      for (const key of keys) {
+        const result = visit(item[key]);
+
+        if (result) {
+          return result;
+        }
+      }
+    }
+
+    return "";
+  };
+
+  return visit(value);
+};
 
 const getImage = (
   song,
@@ -1566,10 +1620,18 @@ const Player = () => {
                   artists:
                     currentSong.artists,
                   audio:
-                    currentSong?.downloadUrl ||
-                    currentSong?.audioUrl ||
-                    currentSong?.audio_url ||
-                    currentSong?.download_url ||
+                    resolveMediaUrl(
+                      currentSong?.downloadUrl
+                    ) ||
+                    resolveMediaUrl(
+                      currentSong?.audioUrl
+                    ) ||
+                    resolveMediaUrl(
+                      currentSong?.audio_url
+                    ) ||
+                    resolveMediaUrl(
+                      currentSong?.download_url
+                    ) ||
                     "",
                 },
               ];
@@ -1671,11 +1733,7 @@ const Player = () => {
       ];
 
       for (const candidate of candidates) {
-        if (!candidate) {
-          continue;
-        }
-
-        const value = String(candidate).trim();
+        const value = resolveMediaUrl(candidate);
 
         if (!value || /^blob:/i.test(value)) {
           continue;

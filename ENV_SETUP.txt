@@ -1,4 +1,0 @@
-Environment setup
-=================
-Copy .env.example to .env.local and add your own Spotify credentials.
-Do not commit or share .env.local.

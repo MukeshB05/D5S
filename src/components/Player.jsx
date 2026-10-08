@@ -38,6 +38,8 @@ import {
 import { Link } from "react-router-dom";
 import he from "he";
 
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { toBlobURL } from "@ffmpeg/util";
 
 import MusicContext from "../context/MusicContext";
 
@@ -62,12 +64,6 @@ const FALLBACK_IMAGE = "/Unknown.png";
 const FFMPEG_CORE_BASE_URL =
   "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm";
 
-const FFMPEG_MODULE_URL =
-  "https://esm.sh/@ffmpeg/ffmpeg@0.12.15?bundle";
-
-const FFMPEG_UTIL_MODULE_URL =
-  "https://esm.sh/@ffmpeg/util@0.12.2?bundle";
-
 let ffmpegInstance = null;
 let ffmpegLoadPromise = null;
 
@@ -76,46 +72,33 @@ const getFFmpeg = async () => {
     return ffmpegInstance;
   }
 
+  if (!ffmpegInstance) {
+    ffmpegInstance = new FFmpeg();
+  }
+
   if (!ffmpegLoadPromise) {
     ffmpegLoadPromise = (async () => {
-      /*
-       * IMPORTANT: FFmpeg is loaded at runtime from a browser CDN.
-       * The @vite-ignore comments prevent Rollup from trying to resolve
-       * @ffmpeg packages during the Vite/Cloudflare/Vercel production build.
-       */
-      const [{ FFmpeg }, { toBlobURL }] =
+      const [coreURL, wasmURL, workerURL] =
         await Promise.all([
-          import(/* @vite-ignore */ FFMPEG_MODULE_URL),
-          import(/* @vite-ignore */ FFMPEG_UTIL_MODULE_URL),
+          toBlobURL(
+            `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`,
+            "text/javascript"
+          ),
+          toBlobURL(
+            `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`,
+            "application/wasm"
+          ),
+          toBlobURL(
+            `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.worker.js`,
+            "text/javascript"
+          ),
         ]);
 
-      if (!ffmpegInstance) {
-        ffmpegInstance = new FFmpeg();
-      }
-
-      if (!ffmpegInstance.loaded) {
-        const [coreURL, wasmURL, workerURL] =
-          await Promise.all([
-            toBlobURL(
-              `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`,
-              "text/javascript"
-            ),
-            toBlobURL(
-              `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`,
-              "application/wasm"
-            ),
-            toBlobURL(
-              `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.worker.js`,
-              "text/javascript"
-            ),
-          ]);
-
-        await ffmpegInstance.load({
-          coreURL,
-          wasmURL,
-          workerURL,
-        });
-      }
+      await ffmpegInstance.load({
+        coreURL,
+        wasmURL,
+        workerURL,
+      });
 
       return ffmpegInstance;
     })().catch((error) => {
@@ -1583,11 +1566,10 @@ const Player = () => {
                   artists:
                     currentSong.artists,
                   audio:
-                    currentSong.audio
-                      ?.currentSrc ||
-                    currentSong.audio
-                      ?.src ||
-                    currentSong.audioUrl ||
+                    currentSong?.downloadUrl ||
+                    currentSong?.audioUrl ||
+                    currentSong?.audio_url ||
+                    currentSong?.download_url ||
                     "",
                 },
               ];
@@ -1664,15 +1646,65 @@ const Player = () => {
       return;
     }
 
-    const url =
-      audio?.currentSrc ||
-      audio?.src ||
-      currentSong?.audioUrl ||
-      currentSong?.downloadUrl;
+    const isHttpUrl = (value) =>
+      typeof value === "string" &&
+      /^https?:\/\//i.test(value.trim());
+
+    const isRelativeUrl = (value) =>
+      typeof value === "string" &&
+      value.trim().startsWith("/") &&
+      !value.trim().startsWith("//");
+
+    /*
+     * Prefer the real song media URL.
+     * Never send a temporary browser blob: URL to the server.
+     */
+    const getValidDownloadSource = () => {
+      const candidates = [
+        currentSong?.downloadUrl,
+        currentSong?.audioUrl,
+        currentSong?.download_url,
+        currentSong?.audio_url,
+        currentSong?.url,
+        audio?.currentSrc,
+        audio?.src,
+      ];
+
+      for (const candidate of candidates) {
+        if (!candidate) {
+          continue;
+        }
+
+        const value = String(candidate).trim();
+
+        if (!value || /^blob:/i.test(value)) {
+          continue;
+        }
+
+        if (isHttpUrl(value)) {
+          return value;
+        }
+
+        if (isRelativeUrl(value)) {
+          try {
+            return new URL(
+              value,
+              window.location.origin
+            ).href;
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      return "";
+    };
+
+    const url = getValidDownloadSource();
 
     if (!url) {
       setDownloadError(
-        "Download URL is not available."
+        "Download URL is not available. Please play the song again and retry."
       );
       setDownloadStatus("Download failed");
       return;
@@ -1733,193 +1765,219 @@ const Player = () => {
       `${safeFilename(title)} - ${safeFilename(artist)}.mp3`;
 
     const downloadBlob = (blob, name) => {
-      const objectUrl =
-        URL.createObjectURL(blob);
-
-      const link =
-        document.createElement("a");
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
 
       link.href = objectUrl;
       link.download = name;
+      link.rel = "noopener";
       link.style.display = "none";
 
       document.body.appendChild(link);
-      link.click();
-      link.remove();
+
+      try {
+        link.click();
+      } finally {
+        link.remove();
+      }
 
       window.setTimeout(() => {
         URL.revokeObjectURL(objectUrl);
-      }, 2000);
+      }, 5000);
     };
 
-    const getDownloadResourceUrl = (
-      resourceUrl
-    ) => {
+    const getDownloadResourceUrl = (resourceUrl) => {
       if (!resourceUrl) {
-        return "";
+        throw new Error("Resource URL is empty.");
       }
 
-      try {
-        const parsed =
-          new URL(
-            resourceUrl,
-            window.location.href
-          );
+      const value = String(resourceUrl).trim();
 
-        if (
-          parsed.origin ===
-          window.location.origin
-        ) {
-          return parsed.href;
-        }
-
-        return `/api/download?url=${encodeURIComponent(
-          parsed.href
-        )}`;
-      } catch {
-        return resourceUrl;
+      if (!value) {
+        throw new Error("Resource URL is empty.");
       }
-    };
 
-    const fetchBytes = async (
-      resourceUrl,
-      statusText
-    ) => {
-      if (!resourceUrl) {
+      if (/^blob:/i.test(value)) {
         throw new Error(
-          "Resource URL is empty."
+          "Temporary browser Blob URL cannot be downloaded from the server."
         );
       }
 
-      setDownloadStatus(
-        statusText
-      );
+      let parsed;
+
+      try {
+        parsed = new URL(
+          value,
+          window.location.href
+        );
+      } catch {
+        throw new Error("Invalid media URL.");
+      }
+
+      if (
+        parsed.protocol !== "http:" &&
+        parsed.protocol !== "https:"
+      ) {
+        throw new Error(
+          `Unsupported media URL protocol: ${parsed.protocol}`
+        );
+      }
+
+      if (
+        parsed.origin === window.location.origin
+      ) {
+        return parsed.href;
+      }
+
+      return `/api/download?url=${encodeURIComponent(
+        parsed.href
+      )}`;
+    };
+
+    const readResponseError = async (response) => {
+      try {
+        const contentType =
+          response.headers.get("content-type") || "";
+
+        if (contentType.includes("application/json")) {
+          const json = await response.json();
+          return json?.error || json?.message || "";
+        }
+
+        if (contentType.includes("text/")) {
+          const text = await response.text();
+          return text
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 300);
+        }
+      } catch {
+        // Ignore response parsing errors.
+      }
+
+      return "";
+    };
+
+    const fetchBytes = async (resourceUrl, statusText) => {
+      if (!resourceUrl) {
+        throw new Error("Resource URL is empty.");
+      }
+
+      setDownloadStatus(statusText);
       setDownloadProgress(0);
       setDownloadBytes(0);
       setDownloadTotalBytes(0);
       setDownloadEta(0);
 
       const proxyUrl =
-        getDownloadResourceUrl(
-          resourceUrl
-        );
+        getDownloadResourceUrl(resourceUrl);
 
-      const response =
-        await fetch(
-          proxyUrl,
-          {
-            method: "GET",
-            credentials:
-              "same-origin",
-            cache: "no-store",
-          }
-        );
+      const response = await fetch(proxyUrl, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "follow",
+      });
 
       if (!response.ok) {
+        const serverError =
+          await readResponseError(response);
+
         throw new Error(
-          `HTTP ${response.status}`
+          serverError
+            ? `Download server error ${response.status}: ${serverError}`
+            : `Download server error ${response.status}`
+        );
+      }
+
+      const contentType =
+        response.headers.get("content-type") || "";
+
+      /* Never send HTML/JSON error pages into FFmpeg. */
+      if (
+        /text\/html/i.test(contentType) ||
+        /application\/json/i.test(contentType)
+      ) {
+        const details =
+          await readResponseError(response);
+
+        throw new Error(
+          details
+            ? `Server returned ${contentType}: ${details}`
+            : `Server returned ${contentType} instead of media.`
         );
       }
 
       const total =
         Number(
-          response.headers.get(
-            "content-length"
-          )
+          response.headers.get("content-length")
         ) || 0;
 
       downloadBytesRef.current = 0;
-      downloadTotalBytesRef.current =
-        total;
-
-      setDownloadTotalBytes(
-        total
-      );
+      downloadTotalBytesRef.current = total;
+      setDownloadTotalBytes(total);
 
       if (
         !response.body ||
-        typeof response.body.getReader !==
-          "function"
+        typeof response.body.getReader !== "function"
       ) {
-        const buffer =
-          new Uint8Array(
-            await response.arrayBuffer()
-          );
-
-        downloadBytesRef.current =
-          buffer.byteLength;
-
-        setDownloadBytes(
-          buffer.byteLength
+        const buffer = new Uint8Array(
+          await response.arrayBuffer()
         );
 
-        setDownloadProgress(
-          total > 0
-            ? 100
-            : 100
-        );
+        if (!buffer.byteLength) {
+          throw new Error("Downloaded media is empty.");
+        }
+
+        downloadBytesRef.current = buffer.byteLength;
+        setDownloadBytes(buffer.byteLength);
+        setDownloadProgress(100);
 
         return buffer;
       }
 
-      const reader =
-        response.body.getReader();
-
+      const reader = response.body.getReader();
       const chunks = [];
       let loaded = 0;
 
       while (true) {
-        const { done, value } =
-          await reader.read();
+        const { done, value } = await reader.read();
 
         if (done) {
           break;
         }
 
-        if (value?.length) {
-          chunks.push(value);
-          loaded += value.length;
-
-          downloadBytesRef.current =
-            loaded;
-
-          setDownloadBytes(
-            loaded
-          );
-
-          setDownloadProgress(
-            total > 0
-              ? Math.min(
-                  100,
-                  (loaded /
-                    total) *
-                    100
-                )
-              : 0
-          );
+        if (!value?.length) {
+          continue;
         }
+
+        chunks.push(value);
+        loaded += value.length;
+
+        downloadBytesRef.current = loaded;
+        setDownloadBytes(loaded);
+
+        setDownloadProgress(
+          total > 0
+            ? Math.min(100, (loaded / total) * 100)
+            : 0
+        );
       }
 
-      const result =
-        new Uint8Array(
-          loaded
-        );
+      if (!loaded) {
+        throw new Error("Downloaded media is empty.");
+      }
 
+      const result = new Uint8Array(loaded);
       let offset = 0;
 
       for (const chunk of chunks) {
-        result.set(
-          chunk,
-          offset
-        );
+        result.set(chunk, offset);
         offset += chunk.length;
       }
 
-      if (!result.length) {
-        throw new Error(
-          "Downloaded media is empty."
-        );
-      }
+      setDownloadBytes(loaded);
+      setDownloadProgress(100);
 
       return result;
     };
@@ -1929,10 +1987,7 @@ const Player = () => {
       setDownloadProgress(
         Math.max(
           0,
-          Math.min(
-            100,
-            Number(progress) || 0
-          )
+          Math.min(100, Number(progress) || 0)
         )
       );
     };
@@ -1943,31 +1998,20 @@ const Player = () => {
     setDownloadTotalBytes(0);
     setDownloadElapsed(0);
     setDownloadEta(0);
-    setDownloadStatus(
-      "Starting download..."
-    );
+    setDownloadStatus("Starting download...");
 
-    downloadStartedAtRef.current =
-      Date.now();
-
+    downloadStartedAtRef.current = Date.now();
     downloadBytesRef.current = 0;
     downloadTotalBytesRef.current = 0;
 
     setIsDownloading(true);
 
     try {
-      /*
-       * AUDIO
-       */
-      const audioData =
-        await fetchBytes(
-          url,
-          "Downloading audio..."
-        );
+      const audioData = await fetchBytes(
+        url,
+        "Downloading audio..."
+      );
 
-      /*
-       * ARTWORK
-       */
       let coverData = null;
 
       if (
@@ -1975,66 +2019,48 @@ const Player = () => {
         artwork !== FALLBACK_IMAGE
       ) {
         try {
-          coverData =
-            await fetchBytes(
-              artwork,
-              "Downloading artwork..."
-            );
+          coverData = await fetchBytes(
+            artwork,
+            "Downloading artwork..."
+          );
         } catch (coverError) {
           console.warn(
             "Cover download failed. Continuing without artwork:",
             coverError
           );
 
+          coverData = null;
           setDownloadStatus(
             "Artwork unavailable — continuing..."
           );
-
-          setDownloadProgress(0);
-          setDownloadBytes(0);
-          setDownloadTotalBytes(0);
         }
       }
 
-      /*
-       * FFMPEG
-       */
       setStage(
         "Preparing 320 kbps MP3...",
         0
       );
 
-      const ff =
-        await getFFmpeg();
+      const ff = await getFFmpeg();
 
-      const onFfmpegProgress =
-        ({ progress: ffProgress }) => {
-          const percent =
-            Math.max(
-              0,
-              Math.min(
-                100,
-                Math.round(
-                  (Number(
-                    ffProgress
-                  ) || 0) * 100
-                )
-              )
-            );
+      const onFfmpegProgress = ({ progress: ffProgress }) => {
+        const percent = Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              (Number(ffProgress) || 0) * 100
+            )
+          )
+        );
 
-          setDownloadStatus(
-            `Converting to 320 kbps MP3... ${percent}%`
-          );
+        setDownloadStatus(
+          `Converting to 320 kbps MP3... ${percent}%`
+        );
+        setDownloadProgress(percent);
+      };
 
-          setDownloadProgress(
-            percent
-          );
-        };
-
-      ff.on(
-        "progress",
-        onFfmpegProgress
-      );
+      ff.on("progress", onFfmpegProgress);
 
       let taggedData;
 
@@ -2061,41 +2087,26 @@ const Player = () => {
         }
       }
 
-      if (
-        !taggedData ||
-        !taggedData.length
-      ) {
+      if (!taggedData?.length) {
         throw new Error(
           "FFmpeg returned an empty MP3."
         );
       }
 
-      /*
-       * COMPLETE
-       */
-      setStage(
-        "Finalizing download...",
-        100
-      );
+      setStage("Finalizing download...", 100);
 
       await new Promise((resolve) =>
-        window.setTimeout(
-          resolve,
-          150
-        )
+        window.setTimeout(resolve, 150)
       );
 
       downloadBlob(
-        new Blob(
-          [taggedData],
-          {
-            type: "audio/mpeg",
-          }
-        ),
+        new Blob([taggedData], {
+          type: "audio/mpeg",
+        }),
         filename
       );
 
-      // Download is complete: do not keep the progress notification on screen.
+      /* Completed downloads do not keep the notification visible. */
       setDownloadProgress(100);
       setDownloadEta(0);
       setDownloadStatus("");
@@ -2106,22 +2117,40 @@ const Player = () => {
         error
       );
 
-      const message =
-        String(
-          error?.message || ""
-        );
-
-      setDownloadError(
-        /memory|allocation|out of memory/i.test(
-          message
-        )
-          ? "This song is too large to convert to 320 kbps MP3 in this mobile browser."
-          : "MP3 conversion failed. Please try the download again."
+      const message = String(
+        error?.message || ""
       );
 
-      setDownloadStatus(
-        "Download failed"
-      );
+      let userMessage =
+        "MP3 conversion failed. Please try the download again.";
+
+      if (/blob|temporary browser/i.test(message)) {
+        userMessage =
+          "The temporary audio URL expired. Please play the song again and retry.";
+      } else if (/403|forbidden|host is not allowed/i.test(message)) {
+        userMessage =
+          "The download server rejected this media source.";
+      } else if (/404|not found/i.test(message)) {
+        userMessage =
+          "The audio file is no longer available. Please try playing the song again.";
+      } else if (/content-type|html|json|server returned/i.test(message)) {
+        userMessage =
+          "The download server returned an invalid media response.";
+      } else if (/network|failed to fetch|fetch/i.test(message)) {
+        userMessage =
+          "Network error while downloading the song. Please try again.";
+      } else if (/memory|allocation|out of memory/i.test(message)) {
+        userMessage =
+          "This song is too large to convert to 320 kbps MP3 in this mobile browser.";
+      } else if (message) {
+        userMessage =
+          message.length > 220
+            ? `${message.slice(0, 220)}...`
+            : message;
+      }
+
+      setDownloadError(userMessage);
+      setDownloadStatus("Download failed");
       setDownloadEta(0);
     } finally {
       setIsDownloading(false);
